@@ -2,13 +2,18 @@ package backupcontroller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
+
+	"sigs.k8s.io/yaml"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -37,15 +42,6 @@ func (l loggerWithDebug) Debug(msg string, keysAndValues ...interface{}) {
 	l.Logger.V(1).Info(msg, keysAndValues...)
 }
 
-// S3Credentials holds the discovered S3 credentials from a Bucket storageRef
-type S3Credentials struct {
-	BucketName      string
-	Endpoint        string
-	Region          string
-	AccessKeyID     string
-	AccessSecretKey string
-}
-
 const (
 	defaultRequeueAfter                 = 5 * time.Second
 	defaultActiveJobPollingInterval     = defaultRequeueAfter
@@ -55,10 +51,25 @@ const (
 	veleroNamespace                  = "cozy-velero"
 	veleroBackupNameMetadataKey      = "velero.io/backup-name"
 	veleroBackupNamespaceMetadataKey = "velero.io/backup-namespace"
+
+	// Annotation key for persisting underlying resources on the Velero Backup object
+	underlyingResourcesAnnotation = "backups.cozystack.io/underlying-resources"
+
+	// VM-specific constants
+	vmInstanceKind        = "VMInstance"
+	vmDiskAppKind         = "VMDisk"
+	vmNamePrefix          = "vm-instance-"
+	vmDiskNamePrefix      = "vm-disk-"
+	appKindLabel          = "apps.cozystack.io/application.kind"
+	appNameLabel          = "apps.cozystack.io/application.name"
+	vmPodNameLabel        = "vm.kubevirt.io/name"
+	ovnIPAnnotation       = "ovn.kubernetes.io/ip_address"
+	ovnMACAnnotation      = "ovn.kubernetes.io/mac_address"
+	cdiAllowClaimAdoption = "cdi.kubevirt.io/allowClaimAdoption"
 )
 
-func boolPtr(b bool) *bool {
-	return &b
+func stringPtr(s string) *string {
+	return &s
 }
 
 func (r *BackupJobReconciler) reconcileVelero(ctx context.Context, j *backupsv1alpha1.BackupJob, resolved *ResolvedBackupConfig) (ctrl.Result, error) {
@@ -197,15 +208,82 @@ func (r *BackupJobReconciler) reconcileVelero(ctx context.Context, j *backupsv1a
 
 	// Step 5: On failure
 	if phase == "Failed" || phase == "PartiallyFailed" {
-		message := fmt.Sprintf("Velero Backup failed with phase: %s", phase)
-		if len(veleroBackup.Status.ValidationErrors) > 0 {
-			message = fmt.Sprintf("%s: %v", message, veleroBackup.Status.ValidationErrors)
-		}
+		message := formatVeleroBackupFailureMessageForBackupJob(ctx, r.Client, veleroBackup)
 		return r.markBackupJobFailed(ctx, j, message)
 	}
 
 	// Still in progress (InProgress, New, etc.)
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+// collectUnderlyingResources discovers resources associated with a VM application
+// (dataVolumes, IP/MAC addresses) that need to be backed up and restored.
+// Returns nil if the application is not a VM type or has no underlying resources.
+func (r *BackupJobReconciler) collectUnderlyingResources(ctx context.Context, app *unstructured.Unstructured, appKind, ns string) (*backupsv1alpha1.UnderlyingResources, error) {
+	logger := getLogger(ctx)
+
+	if appKind != vmInstanceKind {
+		logger.Debug("application is not a VMInstance, skipping underlying resource collection", "kind", appKind)
+		return nil, nil
+	}
+
+	appName := app.GetName()
+
+	// Extract disk names from VMInstance spec.disks[].name
+	disks, found, err := unstructured.NestedSlice(app.Object, "spec", "disks")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read spec.disks from application: %w", err)
+	}
+
+	var dataVolumes []backupsv1alpha1.DataVolumeResource
+	if found {
+		for _, d := range disks {
+			disk, ok := d.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			name, ok := disk["name"].(string)
+			if !ok || name == "" {
+				continue
+			}
+			dataVolumes = append(dataVolumes, backupsv1alpha1.DataVolumeResource{
+				DataVolumeName:  vmDiskNamePrefix + name,
+				ApplicationName: name,
+			})
+		}
+	}
+	logger.Debug("collected dataVolumes from VMInstance", "count", len(dataVolumes), "appName", appName)
+
+	// Find VM Pod to extract OVN IP/MAC addresses
+	vmName := vmNamePrefix + appName
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList,
+		client.InNamespace(ns),
+		client.MatchingLabels{vmPodNameLabel: vmName},
+	); err != nil {
+		logger.Error(err, "failed to list VM pods for IP/MAC collection", "vmName", vmName)
+		// Non-fatal: we can still proceed without IP/MAC
+	}
+
+	var ip, mac string
+	if len(podList.Items) > 0 {
+		pod := podList.Items[0]
+		ip = pod.Annotations[ovnIPAnnotation]
+		mac = pod.Annotations[ovnMACAnnotation]
+		logger.Debug("collected OVN network info from VM pod", "ip", ip, "mac", mac, "pod", pod.Name)
+	} else {
+		logger.Debug("no VM pod found for OVN info", "vmName", vmName)
+	}
+
+	if len(dataVolumes) == 0 && ip == "" && mac == "" {
+		return nil, nil
+	}
+
+	return &backupsv1alpha1.UnderlyingResources{
+		DataVolumes: dataVolumes,
+		IP:          ip,
+		MAC:         mac,
+	}, nil
 }
 
 func (r *BackupJobReconciler) createVeleroBackup(ctx context.Context, backupJob *backupsv1alpha1.BackupJob, strategy *strategyv1alpha1.Velero, resolved *ResolvedBackupConfig) error {
@@ -225,6 +303,13 @@ func (r *BackupJobReconciler) createVeleroBackup(ctx context.Context, backupJob 
 		return err
 	}
 
+	// Collect underlying resources (VM disks, IP/MAC)
+	underlyingResources, err := r.collectUnderlyingResources(ctx, app, backupJob.Spec.ApplicationRef.Kind, backupJob.Namespace)
+	if err != nil {
+		logger.Error(err, "failed to collect underlying resources, proceeding without them")
+		// Non-fatal: proceed with backup even if collection fails
+	}
+
 	templateContext := map[string]interface{}{
 		"Application": app.Object,
 		"Parameters":  resolved.Parameters,
@@ -234,6 +319,33 @@ func (r *BackupJobReconciler) createVeleroBackup(ctx context.Context, backupJob 
 	if err != nil {
 		return err
 	}
+
+	// Add label selectors for underlying VMDisk HelmReleases
+	if underlyingResources != nil {
+		for _, dv := range underlyingResources.DataVolumes {
+			veleroBackupSpec.OrLabelSelectors = append(veleroBackupSpec.OrLabelSelectors, &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					appKindLabel: vmDiskAppKind,
+					appNameLabel: dv.ApplicationName,
+				},
+			})
+		}
+		if len(underlyingResources.DataVolumes) > 0 {
+			logger.Debug("added VMDisk label selectors to Velero backup", "count", len(underlyingResources.DataVolumes))
+		}
+	}
+
+	// Serialize underlying resources as annotation to persist across reconcile cycles
+	annotations := map[string]string{}
+	if underlyingResources != nil {
+		urJSON, err := json.Marshal(underlyingResources)
+		if err != nil {
+			logger.Error(err, "failed to marshal underlying resources annotation")
+		} else {
+			annotations[underlyingResourcesAnnotation] = string(urJSON)
+		}
+	}
+
 	veleroBackup := &velerov1.Backup{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: fmt.Sprintf("%s.%s-", backupJob.Namespace, backupJob.Name),
@@ -242,6 +354,7 @@ func (r *BackupJobReconciler) createVeleroBackup(ctx context.Context, backupJob 
 				backupsv1alpha1.OwningJobNameLabel:      backupJob.Name,
 				backupsv1alpha1.OwningJobNamespaceLabel: backupJob.Namespace,
 			},
+			Annotations: annotations,
 		},
 		Spec: *veleroBackupSpec,
 	}
@@ -284,19 +397,22 @@ func (r *BackupJobReconciler) createBackupResource(ctx context.Context, backupJo
 		URI: fmt.Sprintf("velero://%s/%s", veleroBackup.Namespace, veleroBackup.Name),
 	}
 
+	// Read underlying resources from Velero Backup annotation
+	var underlyingResources *backupsv1alpha1.UnderlyingResources
+	if urJSON, ok := veleroBackup.Annotations[underlyingResourcesAnnotation]; ok && urJSON != "" {
+		underlyingResources = &backupsv1alpha1.UnderlyingResources{}
+		if err := json.Unmarshal([]byte(urJSON), underlyingResources); err != nil {
+			logger.Error(err, "failed to unmarshal underlying resources from Velero Backup annotation")
+			underlyingResources = nil
+		}
+	}
+
+	// Note: No OwnerReferences set on Backup. The Backup must survive BackupJob deletion
+	// so users don't lose their backup artifacts when cleaning up completed jobs.
 	backup := &backupsv1alpha1.Backup{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      backupJob.Name,
 			Namespace: backupJob.Namespace,
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion: backupJob.APIVersion,
-					Kind:       backupJob.Kind,
-					Name:       backupJob.Name,
-					UID:        backupJob.UID,
-					Controller: boolPtr(true),
-				},
-			},
 		},
 		Spec: backupsv1alpha1.BackupSpec{
 			ApplicationRef: backupJob.Spec.ApplicationRef,
@@ -305,8 +421,9 @@ func (r *BackupJobReconciler) createBackupResource(ctx context.Context, backupJo
 			DriverMetadata: driverMetadata,
 		},
 		Status: backupsv1alpha1.BackupStatus{
-			Phase:    backupsv1alpha1.BackupPhaseReady,
-			Artifact: artifact,
+			Phase:               backupsv1alpha1.BackupPhaseReady,
+			Artifact:            artifact,
+			UnderlyingResources: underlyingResources,
 		},
 	}
 
@@ -319,7 +436,8 @@ func (r *BackupJobReconciler) createBackupResource(ctx context.Context, backupJo
 		return nil, err
 	}
 
-	logger.Debug("created Backup resource", "name", backup.Name)
+	logger.Debug("created Backup resource", "name", backup.Name,
+		"hasUnderlyingResources", underlyingResources != nil)
 	return backup, nil
 }
 
@@ -430,6 +548,173 @@ func (r *RestoreJobReconciler) reconcileVeleroRestore(ctx context.Context, resto
 	return ctrl.Result{RequeueAfter: defaultRestoreRequeueAfter}, nil
 }
 
+// Velero resource modifier types (local mirrors of the internal Velero types).
+
+type resourceModifiers struct {
+	Version               string                 `yaml:"version"`
+	ResourceModifierRules []resourceModifierRule `yaml:"resourceModifierRules"`
+}
+
+type resourceModifierRule struct {
+	Conditions   resourceModifierConditions `yaml:"conditions"`
+	MergePatches []mergePatch               `yaml:"mergePatches,omitempty"`
+}
+
+type resourceModifierConditions struct {
+	GroupResource     string   `yaml:"groupResource"`
+	ResourceNameRegex string   `yaml:"resourceNameRegex,omitempty"`
+	Namespaces        []string `yaml:"namespaces,omitempty"`
+}
+
+type mergePatch struct {
+	PatchData string `yaml:"patchData"`
+}
+
+// marshalPatchData marshals an arbitrary object to YAML for use as
+// mergePatch.PatchData in Velero resource modifiers.
+func marshalPatchData(v interface{}) (string, error) {
+	b, err := yaml.Marshal(v)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal patch data: %w", err)
+	}
+	return string(b), nil
+}
+
+// createResourceModifiersConfigMap creates a Velero resource modifiers ConfigMap
+// that patches VM resources during restore:
+//   - PVC adoption: always adds cdi.kubevirt.io/allowClaimAdoption=true to all
+//     restored PVCs so CDI can adopt them when a HelmRelease of VMDisk recreates a DV.
+//   - OVN IP/MAC: sets OVN annotations on the VirtualMachine for correct ssh access to restored VM.
+func (r *RestoreJobReconciler) createResourceModifiersConfigMap(ctx context.Context, restoreJob *backupsv1alpha1.RestoreJob, backup *backupsv1alpha1.Backup) (*corev1.ConfigMap, error) {
+	logger := getLogger(ctx)
+
+	ur := backup.Status.UnderlyingResources
+	targetNS := backup.Namespace
+
+	var rules []resourceModifierRule
+
+	// PVC adoption: allow CDI to adopt restored PVCs when the HelmRelease recreates a DV.
+	pvcPatch, err := marshalPatchData(map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"annotations": map[string]string{
+				cdiAllowClaimAdoption: "true",
+			},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	rules = append(rules, resourceModifierRule{
+		Conditions: resourceModifierConditions{
+			GroupResource:     "persistentvolumeclaims",
+			ResourceNameRegex: ".*",
+			Namespaces:        []string{targetNS},
+		},
+		MergePatches: []mergePatch{{PatchData: pvcPatch}},
+	})
+
+	// OVN IP/MAC annotations on VirtualMachine for correct network identity after restore.
+	if ur != nil && (ur.IP != "" || ur.MAC != "") {
+		ovnAnnotations := map[string]string{}
+		if ur.IP != "" {
+			ovnAnnotations[ovnIPAnnotation] = ur.IP
+		}
+		if ur.MAC != "" {
+			ovnAnnotations[ovnMACAnnotation] = ur.MAC
+		}
+		vmPatch, err := marshalPatchData(map[string]interface{}{
+			"spec": map[string]interface{}{
+				"template": map[string]interface{}{
+					"metadata": map[string]interface{}{
+						"annotations": ovnAnnotations,
+					},
+				},
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		rules = append(rules, resourceModifierRule{
+			Conditions: resourceModifierConditions{
+				GroupResource:     "virtualmachines.kubevirt.io",
+				ResourceNameRegex: ".*",
+				Namespaces:        []string{targetNS},
+			},
+			MergePatches: []mergePatch{{PatchData: vmPatch}},
+		})
+	}
+
+	rulesYAML, err := yaml.Marshal(resourceModifiers{
+		Version:               "v1",
+		ResourceModifierRules: rules,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal resource modifier rules: %w", err)
+	}
+
+	cmName := fmt.Sprintf("restore-modifiers-%s-%s", restoreJob.Namespace, restoreJob.Name)
+	// Truncate name to fit Kubernetes 253-char limit
+	if len(cmName) > 253 {
+		cmName = cmName[:253]
+	}
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cmName,
+			Namespace: veleroNamespace,
+			Labels: map[string]string{
+				backupsv1alpha1.OwningJobNameLabel:      restoreJob.Name,
+				backupsv1alpha1.OwningJobNamespaceLabel: restoreJob.Namespace,
+			},
+		},
+		Data: map[string]string{
+			"resource-modifier-rules.yaml": string(rulesYAML),
+		},
+	}
+
+	if err := r.Create(ctx, cm); err != nil {
+		if errors.IsAlreadyExists(err) {
+			// ConfigMap already exists (e.g. RestoreJob recreated with same name).
+			// Update its data to reflect the current backup's underlying resources.
+			existing := &corev1.ConfigMap{}
+			if err := r.Get(ctx, client.ObjectKey{Namespace: veleroNamespace, Name: cmName}, existing); err != nil {
+				return nil, fmt.Errorf("failed to get existing resourceModifiers ConfigMap: %w", err)
+			}
+			existing.Data = cm.Data
+			if err := r.Update(ctx, existing); err != nil {
+				return nil, fmt.Errorf("failed to update existing resourceModifiers ConfigMap: %w", err)
+			}
+			logger.Debug("updated existing resourceModifiers ConfigMap", "name", cmName)
+			return existing, nil
+		}
+		return nil, fmt.Errorf("failed to create resourceModifiers ConfigMap: %w", err)
+	}
+
+	logger.Debug("created resourceModifiers ConfigMap", "name", cm.Name, "namespace", cm.Namespace)
+	return cm, nil
+}
+
+// resolveUnderlyingResourcesForRestore returns disk (and network) metadata for symmetric
+// restore label selectors. Velero Backup annotation is used when Backup.status was empty
+// (e.g. CRD without underlyingResources in schema).
+func (r *RestoreJobReconciler) resolveUnderlyingResourcesForRestore(ctx context.Context, backup *backupsv1alpha1.Backup, veleroBackupName string) *backupsv1alpha1.UnderlyingResources {
+	if backup.Status.UnderlyingResources != nil && len(backup.Status.UnderlyingResources.DataVolumes) > 0 {
+		return backup.Status.UnderlyingResources
+	}
+	vb := &velerov1.Backup{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: veleroNamespace, Name: veleroBackupName}, vb); err != nil {
+		return backup.Status.UnderlyingResources
+	}
+	if urJSON, ok := vb.Annotations[underlyingResourcesAnnotation]; ok && urJSON != "" {
+		ur := &backupsv1alpha1.UnderlyingResources{}
+		if err := json.Unmarshal([]byte(urJSON), ur); err != nil {
+			return backup.Status.UnderlyingResources
+		}
+		return ur
+	}
+	return backup.Status.UnderlyingResources
+}
+
 // createVeleroRestore creates a Velero Restore resource.
 func (r *RestoreJobReconciler) createVeleroRestore(ctx context.Context, restoreJob *backupsv1alpha1.RestoreJob, backup *backupsv1alpha1.Backup, strategy *strategyv1alpha1.Velero, veleroBackupName string) error {
 	logger := getLogger(ctx)
@@ -461,6 +746,38 @@ func (r *RestoreJobReconciler) createVeleroRestore(ctx context.Context, restoreJ
 	// Set the backupName in the spec (required by Velero)
 	veleroRestoreSpec.BackupName = veleroBackupName
 
+	// Match backup: add OR selectors for each underlying VMDisk so restore applies the same
+	// scope as the intended backup (see createVeleroBackup). Prefer Backup status; fall back
+	// to Velero Backup annotation when status was pruned by an older CRD.
+	ur := r.resolveUnderlyingResourcesForRestore(ctx, backup, veleroBackupName)
+	if ur != nil {
+		for _, dv := range ur.DataVolumes {
+			veleroRestoreSpec.OrLabelSelectors = append(veleroRestoreSpec.OrLabelSelectors, &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					appKindLabel: vmDiskAppKind,
+					appNameLabel: dv.ApplicationName,
+				},
+			})
+		}
+		if len(ur.DataVolumes) > 0 {
+			logger.Debug("added VMDisk label selectors to Velero restore", "count", len(ur.DataVolumes))
+		}
+	}
+
+	// Create resourceModifiers ConfigMap
+	resourceModifierCM, err := r.createResourceModifiersConfigMap(ctx, restoreJob, backup)
+	if err != nil {
+		return fmt.Errorf("failed to create resourceModifiers ConfigMap: %w", err)
+	}
+	if resourceModifierCM != nil {
+		veleroRestoreSpec.ResourceModifier = &corev1.TypedLocalObjectReference{
+			APIGroup: stringPtr(""),
+			Kind:     "ConfigMap",
+			Name:     resourceModifierCM.Name,
+		}
+		logger.Debug("set resourceModifier on Velero Restore", "configMap", resourceModifierCM.Name)
+	}
+
 	generateName := fmt.Sprintf("%s.%s-", restoreJob.Namespace, restoreJob.Name)
 	veleroRestore := &velerov1.Restore{
 		ObjectMeta: metav1.ObjectMeta{
@@ -484,4 +801,61 @@ func (r *RestoreJobReconciler) createVeleroRestore(ctx context.Context, restoreJ
 	r.Recorder.Event(restoreJob, corev1.EventTypeNormal, "VeleroRestoreCreated",
 		fmt.Sprintf("Created Velero Restore %s/%s", veleroNamespace, veleroRestore.Name))
 	return nil
+}
+
+// dataUploadListGVK is the API version shipped with Velero data mover CRDs (see velero datauploads CRD).
+var dataUploadListGVK = schema.GroupVersionKind{Group: "velero.io", Version: "v2alpha1", Kind: "DataUploadList"}
+
+// formatVeleroBackupFailureMessageForBackupJob builds a BackupJob status message from Velero Backup
+// status plus failed DataUpload resources (CSI data mover), similar to `velero backup describe`.
+func formatVeleroBackupFailureMessageForBackupJob(ctx context.Context, c client.Client, veleroBackup *velerov1.Backup) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Velero Backup failed with phase %s", veleroBackup.Status.Phase)
+	if fr := strings.TrimSpace(veleroBackup.Status.FailureReason); fr != "" {
+		fmt.Fprintf(&b, ": %s", fr)
+	}
+	if len(veleroBackup.Status.ValidationErrors) > 0 {
+		fmt.Fprintf(&b, "; validation: %v", veleroBackup.Status.ValidationErrors)
+	}
+	if h := veleroBackup.Status.HookStatus; h != nil && h.HooksFailed > 0 {
+		fmt.Fprintf(&b, "; hooks failed %d/%d", h.HooksFailed, h.HooksAttempted)
+	}
+	if veleroBackup.Status.BackupItemOperationsFailed > 0 {
+		fmt.Fprintf(&b, "; async item operations failed %d (completed %d, attempted %d)",
+			veleroBackup.Status.BackupItemOperationsFailed,
+			veleroBackup.Status.BackupItemOperationsCompleted,
+			veleroBackup.Status.BackupItemOperationsAttempted)
+	}
+	b.WriteString(appendFailedDataUploadMessages(ctx, c, veleroBackup.Name))
+	return b.String()
+}
+
+func appendFailedDataUploadMessages(ctx context.Context, c client.Client, veleroBackupName string) string {
+	ul := unstructured.UnstructuredList{}
+	ul.SetGroupVersionKind(dataUploadListGVK)
+	if err := c.List(ctx, &ul, client.InNamespace(veleroNamespace)); err != nil {
+		return ""
+	}
+	prefix := veleroBackupName + "-"
+	var b strings.Builder
+	for _, item := range ul.Items {
+		if !strings.HasPrefix(item.GetName(), prefix) {
+			continue
+		}
+		phase, _, _ := unstructured.NestedString(item.Object, "status", "phase")
+		if phase != "Failed" {
+			continue
+		}
+		msg, _, _ := unstructured.NestedString(item.Object, "status", "message")
+		if strings.TrimSpace(msg) == "" {
+			msg = "(empty status.message)"
+		}
+		srcPVC, _, _ := unstructured.NestedString(item.Object, "spec", "sourcePVC")
+		if srcPVC != "" {
+			fmt.Fprintf(&b, "; DataUpload %s failed for PVC %s: %s", item.GetName(), srcPVC, msg)
+		} else {
+			fmt.Fprintf(&b, "; DataUpload %s failed: %s", item.GetName(), msg)
+		}
+	}
+	return b.String()
 }

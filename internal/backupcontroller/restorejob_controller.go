@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -101,17 +100,6 @@ func (r *RestoreJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&backupsv1alpha1.RestoreJob{}).
 		Complete(r)
-}
-
-// getTargetApplicationRef determines the effective target application reference.
-// According to DESIGN.md, if spec.targetApplicationRef is omitted, drivers SHOULD
-// restore into backup.spec.applicationRef.
-// The returned reference is normalized to ensure APIGroup has a default value.
-func (r *RestoreJobReconciler) getTargetApplicationRef(restoreJob *backupsv1alpha1.RestoreJob, backup *backupsv1alpha1.Backup) corev1.TypedLocalObjectReference {
-	if restoreJob.Spec.TargetApplicationRef != nil {
-		return backupsv1alpha1.NormalizeApplicationRef(*restoreJob.Spec.TargetApplicationRef)
-	}
-	return backup.Spec.ApplicationRef
 }
 
 // markRestoreJobFailed updates the RestoreJob status to Failed with the given message.
