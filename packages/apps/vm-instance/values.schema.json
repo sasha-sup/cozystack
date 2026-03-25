@@ -134,6 +134,20 @@
       "type": "string",
       "default": "u1.medium"
     },
+    "networks": {
+      "description": "Networks to attach the VM to.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "description": "Network attachment name.",
+            "type": "string"
+          }
+        }
+      }
+    },
     "resources": {
       "description": "Resource configuration for the virtual machine.",
       "type": "object",
@@ -201,14 +215,14 @@
       }
     },
     "subnets": {
-      "description": "Additional subnets",
+      "description": "Deprecated: use networks instead.",
       "type": "array",
       "default": [],
       "items": {
         "type": "object",
         "properties": {
           "name": {
-            "description": "Subnet name",
+            "description": "Network attachment name.",
             "type": "string"
           }
         }
